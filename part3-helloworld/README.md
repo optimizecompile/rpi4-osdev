@@ -128,7 +128,7 @@ enum {
 };
 
 enum {
-    GPIO_MAX_PIN       = 53,
+    GPIO_MAX_PIN       = 58,
     GPIO_FUNCTION_ALT5 = 2,
 };
 
