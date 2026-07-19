@@ -28,12 +28,31 @@ So... to build the first WGT sample simply type `cp samples/wgt01.c .` from the 
 
 boot/boot.S changes
 -------------------
-We're still booting into a multicore environment (just in case we need it). There are a few significant changes to _boot/boot.S_ though. They are:
+We're still booting into a multicore environment (just in case we need it), using the official spin-table boot from part10: only core 0 arrives at `_start`, while the firmware parks cores 1-3 until _lib/multicore.c_ releases them into `secondary_entry`. On top of that, this part makes a few significant changes to _boot/boot.S_:
 
- * Enable FPU (floating-point unit) access so we can do non-integer mathematics
- * Switch from EL3 (supervisor exception level) down to EL1 (kernel exception level), disabling the MMU all the same
- * Move the addresses for the `spin_cpu` variables to accommodate a larger _boot.S_
+ * Enable FPU (floating-point unit) access so we can do non-integer mathematics. And not just on the main core: the WGT library and the Bluetooth code both use floating-point, and the trap registers involved are per-core, so every core sets this up for itself
+ * Switch from EL2 (hypervisor exception level) down to EL1 (kernel exception level), keeping the MMU disabled all the same. Since the firmware now starts us at EL2 rather than EL3, the old `scr_el3`/`spsr_el3`/`elr_el3` dance becomes `hcr_el2`/`spsr_el2`/`elr_el2` - the same idea, one level down. It lives in a little `el2_to_el1` routine that every core passes through on its way in
+ * Set `cnthctl_el2` so that EL1 may read the physical counter. Without this, the very first `wait_msec()` would trap to EL2 - where we have no exception handlers - and hang the core. We never needed it when arriving from EL3, because that gate simply didn't apply
  * Implement a `get_el` function to check which exception level we're at (for debug mainly)
+
+Some things from this part's earlier, `kernel_old=1`-era _boot.S_ are conspicuously gone, too. There's no timer setup any more - the firmware's stub has already programmed it, and `cntfrq_el0` is only writable from EL3, which is now above our pay grade. And the `spin_cpu` variables no longer need pinning to fixed addresses with `.org` directives to keep them clear of the growing boot code: nothing refers to them by address any more, so they're ordinary labels that the linker places wherever it likes.
+
+Using the Node.js BLE controller (macOS)
+----------------------------------------
+The controller in _controller-node/_ turns your Mac into the mouse: it captures global mouse input with [uiohook-napi](https://github.com/SnosMe/uiohook-napi) and streams it to the Pi over BLE. Before you first run it:
+
+```bash
+cd controller-node
+npm install
+./rebuild-uiohook.sh
+node main.js
+```
+
+That third step matters! The stock uiohook-napi has a nasty macOS bug when used from plain Node.js: every physical mouse click (and key press) arrives with a companion "system-defined" event, and the library parses it by synchronously handing work to the process's _main thread dispatch queue_. Frameworks like Electron drain that queue; plain Node.js never does. The result is that the hook thread deadlocks on your **first click** - mouse moves stream happily until you press a button, then everything goes silent while the process looks perfectly healthy. We found it by sampling the frozen process and catching the thread stuck in `dispatch_sync` waiting on a queue with no consumer!
+
+_rebuild-uiohook.sh_ rebuilds the library's native module with _uiohook-darwin-event-tap.patch_ applied, which reads those event fields without the main thread's help (plus makes the event tap listen-only and teaches it to recover if macOS ever disables it). Re-run the script any time you `npm install`, as that restores the stock (broken) prebuilt binary. You'll need git and the Xcode command line tools installed.
+
+One more macOS thing: the first run will prompt you to grant your terminal Accessibility/Input Monitoring permission (System Settings → Privacy & Security) - global mouse capture doesn't work without it.
 
 Using the iOS BLE controller
 ----------------------------

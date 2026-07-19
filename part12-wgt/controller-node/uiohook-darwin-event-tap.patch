@@ -1,0 +1,119 @@
+diff --git a/src/darwin/input_hook.c b/src/darwin/input_hook.c
+index e6cd6ce..a16cd56 100644
+--- a/src/darwin/input_hook.c
++++ b/src/darwin/input_hook.c
+@@ -53,6 +53,11 @@ TISEventMessage *tis_event_message;
+ // Event runloop reference.
+ CFRunLoopRef event_loop;
+ 
++// Cached multi-click time, primed once in hook_run. Querying it live involves
++// IPC (CFPreferences/IOKit) which must never happen inside the event tap
++// callback while a click is in flight - the system is waiting on our verdict
++static long int multi_click_time_cache = 500;
++
+ // Modifiers for tracking key masks.
+ static uint16_t current_modifiers = 0x0000;
+ 
+@@ -274,13 +279,16 @@ static inline void process_key_pressed(uint64_t timestamp, CGEventRef event_ref)
+         tis_keycode_message->length = 0;
+         bool is_runloop_main = CFEqual(event_loop, CFRunLoopGetMain());
+ 
+-        if (dispatch_sync_f_f != NULL && dispatch_main_queue_s != NULL && !is_runloop_main) {
+-            logger(LOG_LEVEL_DEBUG, "%s [%u]: Using dispatch_sync_f for key typed events.\n",
+-                    __FUNCTION__, __LINE__);
+-            (*dispatch_sync_f_f)(dispatch_main_queue_s, tis_keycode_message, &keycode_to_lookup);
++        // Never dispatch_sync to the main queue here (see process_system_key) -
++        // that deadlocks the hook thread in processes that don't drain it, which
++        // is why the first KEY press froze us too. The branch below signals the
++        // main runloop instead, and safely skips when it isn't running (we only
++        // lose the unicode "key typed" lookup - keydown/keyup still work)
++        if (is_runloop_main) {
++            keycode_to_lookup(tis_keycode_message);
+         }
+         #if !defined(USE_CARBON_LEGACY) && defined(USE_APPLICATION_SERVICES)
+-        else if (!is_runloop_main) {
++        else {
+             logger(LOG_LEVEL_DEBUG, "%s [%u]: Using CFRunLoopWakeUp for key typed events.\n",
+                     __FUNCTION__, __LINE__);
+ 
+@@ -322,9 +330,6 @@ static inline void process_key_pressed(uint64_t timestamp, CGEventRef event_ref)
+             pthread_mutex_unlock(&main_runloop_mutex);
+         }
+         #endif
+-        else {
+-            keycode_to_lookup(tis_keycode_message);
+-        }
+ 
+         for (unsigned int i = 0; i < tis_keycode_message->length; i++) {
+             // Populate key typed event.
+@@ -509,14 +514,13 @@ static inline void process_system_key(uint64_t timestamp, CGEventRef event_ref)
+         tis_event_message->subtype = 0;
+         tis_event_message->data1 = 0;
+ 
+-        if (dispatch_sync_f_f != NULL && dispatch_main_queue_s != NULL && !is_runloop_main) {
+-            logger(LOG_LEVEL_DEBUG, "%s [%u]: Using dispatch_sync_f for system key events.\n",
+-                    __FUNCTION__, __LINE__);
+-
+-            (*dispatch_sync_f_f)(dispatch_main_queue_s, tis_event_message, &obcj_message);
+-            subtype = tis_event_message->subtype;
+-            data1 = tis_event_message->data1;
+-        } else if (is_runloop_main) {
++        // Never dispatch_sync to the main queue here: in a plain node process
++        // nothing ever drains that queue, so the hook thread deadlocks forever.
++        // macOS sends one of these NX_SYSDEFINED events with every mouse click,
++        // which froze the hook on the first click. When we aren't the main
++        // runloop, fall through to the serialization method below - it reads
++        // the same fields without any other thread's help
++        if (is_runloop_main) {
+             obcj_message(tis_event_message);
+             subtype = tis_event_message->subtype;
+             data1 = tis_event_message->data1;
+@@ -685,8 +689,9 @@ static inline void process_system_key(uint64_t timestamp, CGEventRef event_ref)
+ 
+ 
+ static inline void process_button_pressed(uint64_t timestamp, CGEventRef event_ref, uint16_t button) {
+-    // Track the number of clicks.
+-    if (button == click_button && (long int) (timestamp - click_time) / 1000000 <= hook_get_multi_click_time()) {
++
++    // Track the number of clicks (against the cached multi-click time - see multi_click_time_cache).
++    if (button == click_button && (long int) (timestamp - click_time) / 1000000 <= multi_click_time_cache) {
+         if (click_count < USHRT_MAX) {
+             click_count++;
+         }
+@@ -986,9 +991,10 @@ CGEventRef hook_event_proc(CGEventTapProxy tap_proxy, CGEventType type, CGEventR
+         default:
+             // Check for an old OS X bug where the tap seems to timeout for no reason.
+             // See: http://stackoverflow.com/questions/2969110/cgeventtapcreate-breaks-down-mysteriously-with-key-down-events#2971217
+-            if (type == (CGEventType) kCGEventTapDisabledByTimeout) {
+-                logger(LOG_LEVEL_WARN, "%s [%u]: CGEventTap timeout!\n",
+-                        __FUNCTION__, __LINE__);
++            if (type == (CGEventType) kCGEventTapDisabledByTimeout
++                    || type == (CGEventType) kCGEventTapDisabledByUserInput) {
++                logger(LOG_LEVEL_WARN, "%s [%u]: CGEventTap disabled (%#X)!\n",
++                        __FUNCTION__, __LINE__, (unsigned int) type);
+ 
+                 // We need to re-enable the tap
+                 if (hook->port) {
+@@ -1176,7 +1182,7 @@ static int create_event_runloop_info(event_runloop_info **hook) {
+     (*hook)->port = CGEventTapCreate(
+             kCGSessionEventTap,       // kCGHIDEventTap
+             kCGHeadInsertEventTap,    // kCGTailAppendEventTap
+-            kCGEventTapOptionDefault, // kCGEventTapOptionListenOnly See https://github.com/kwhat/jnativehook/issues/22
++            kCGEventTapOptionListenOnly, // We only observe input, never modify it - a passive tap gives macOS no reason to disable us on a click
+             event_mask,
+             hook_event_proc,
+             NULL);
+@@ -1281,6 +1287,13 @@ UIOHOOK_API int hook_run() {
+             // Initialize starting modifiers.
+             initialize_modifiers();
+ 
++            // Prime the multi-click time cache while no event is in flight -
++            // this query does IPC and must not run inside the tap callback
++            long int multi_click_time = hook_get_multi_click_time();
++            if (multi_click_time > 0) {
++                multi_click_time_cache = multi_click_time;
++            }
++
+             // Try and allocate memory for event_runloop_info.
+             int event_runloop_status = create_event_runloop_info(&hook);
+             if (event_runloop_status != UIOHOOK_SUCCESS) {
