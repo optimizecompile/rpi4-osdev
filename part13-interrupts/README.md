@@ -20,8 +20,8 @@ The codebase
 Let me quickly explain what you're looking at in the _part13-interrupts_ code:
 
  * _boot/_ : the same _boot_ code directory from _part12-wgt_
- * _include/_ : some useful headers copied directly from _part11-multicore_ 
- * _lib/_ : some useful libraries copied directly from _part11-multicore_
+ * _include/_ : some useful headers copied directly from _part10-multicore_ 
+ * _lib/_ : some useful libraries copied directly from _part10-multicore_
  * _kernel/_ : the only new code we need to concern ourselves with in this tutorial
 
 Please note: I have also done some work to tidy up the _Makefile_ and respect this directory structure, but nothing to write home about!
@@ -76,23 +76,22 @@ In the middle we simply call a function called `handle_irq()` which is written i
 
 ```c
 void handle_irq() {
-    unsigned int irq = REGS_IRQ->irq0_pending_0;
+    unsigned int ack = REGS_GICC->interrupt_ack;   // Claim the interrupt...
+    unsigned int irq = ack & 0x3ff;                // ...its number is in the low 10 bits
 
-    while(irq & (SYS_TIMER_IRQ_1 | SYS_TIMER_IRQ_3)) {
-        if (irq & SYS_TIMER_IRQ_1) {
-            irq &= ~SYS_TIMER_IRQ_1;
+    while (irq != 1023) {                          // 1023 means "nothing (left) to handle"
+        if (irq == SYS_TIMER_IRQ_1) handle_timer_1();
+        if (irq == SYS_TIMER_IRQ_3) handle_timer_3();
 
-            handle_timer_1();
-        }
+        REGS_GICC->end_of_interrupt = ack;         // Tell the GIC we're done with this one
 
-        if (irq & SYS_TIMER_IRQ_3) {
-            irq &= ~SYS_TIMER_IRQ_3;
-
-            handle_timer_3();
-        }
+        ack = REGS_GICC->interrupt_ack;            // Anything else waiting?
+        irq = ack & 0x3ff;
     }
 }
 ```
+
+We ask the interrupt controller which interrupt fired by reading its "interrupt acknowledge" register - a read which also _claims_ the interrupt as ours to deal with. Once the right sub-handler has run, we write the same value back to the "end of interrupt" register to signal that we're done. This claim/complete handshake is exactly how Linux talks to the same hardware!
 
 As you can see, we're handling two different timer interrupts in this code. In fact, `handle_timer_1()` and `handle_timer_3()` are implemented in _kernel.c_ and serve to demonstrate that the timer has fired by incrementing a progress counter and updating a graphical representation of its value. Timer 3 is configured to progress at 4 times the speed of Timer 1.
 
@@ -100,15 +99,25 @@ The interrupt controller
 ------------------------
 The interrupt controller is the hardware responsible for telling the CPU about interrupts as they occur. We can use the interrupt controller to act as a gatekeeper and allow/block (or enable/disable) interrupts. We can also use it to figure out which device generated the interrupt, as we did in `handle_irq()`.
 
-In `enable_interrupt_controller()`, called from `main()` in _kernel.c_, we allow the Timer 1 and Timer 3 interrupts through and in `disable_interrupt_controller()` we block all interrupts:
+Back in the `kernel_old=1` days, this meant the Pi's legacy (ARMC) interrupt controller, and enabling an interrupt was a single register write. The official boot flow we adopted in _part10-multicore_ changes the game: the firmware's stub switches on the Pi 4's real interrupt controller - the Arm **GIC-400** - and it's now the GIC, not the legacy controller, that pokes the cores. The stub does the general set-up for us (distributor and per-core CPU interfaces enabled, nothing masked by priority), but it deliberately routes no peripheral interrupts anywhere. That's our job.
+
+VideoCore peripheral interrupts arrive at the GIC numbered upwards from 96, so System Timer 1 is interrupt `96 + 1 = 97` and System Timer 3 is `96 + 3 = 99` (as captured in the `vc_irqs` enum in _kernel.h_). In `enable_interrupt_controller()`, called from `main()` in _kernel.c_, we point each timer interrupt at core 0 and then unblock it in the GIC's distributor, while `disable_interrupt_controller()` blocks them again:
 
 ```c
 void enable_interrupt_controller() {
-    REGS_IRQ->irq0_enable_0 = SYS_TIMER_IRQ_1 | SYS_TIMER_IRQ_3;
+    // Point our two timer interrupts at core 0, then unblock them in the
+    // distributor. Each set_enable word covers 32 interrupts, so interrupt
+    // n lives at bit (n % 32) of word (n / 32)
+    REGS_GICD->target[SYS_TIMER_IRQ_1] = 1;
+    REGS_GICD->target[SYS_TIMER_IRQ_3] = 1;
+
+    REGS_GICD->set_enable[SYS_TIMER_IRQ_1 / 32] = 1 << (SYS_TIMER_IRQ_1 % 32);
+    REGS_GICD->set_enable[SYS_TIMER_IRQ_3 / 32] = 1 << (SYS_TIMER_IRQ_3 % 32);
 }
 
 void disable_interrupt_controller() {
-    REGS_IRQ->irq0_enable_0 = 0;
+    REGS_GICD->clear_enable[SYS_TIMER_IRQ_1 / 32] = 1 << (SYS_TIMER_IRQ_1 % 32);
+    REGS_GICD->clear_enable[SYS_TIMER_IRQ_3 / 32] = 1 << (SYS_TIMER_IRQ_3 % 32);
 }
 ```
 
@@ -153,7 +162,7 @@ Handling the timer interrupts
 -----------------------------
 This is the simplest bit.
 
-We update the compare register so the next interrupt will be generated after the same interval again. Importantly we then acknowledge the interrupt by setting the right bit of the Control Status register.
+We update the compare register so the next interrupt will be generated after the same interval again. Importantly, we then clear the interrupt at its source by writing the timer's own match bit to the Control Status register (which is write-1-to-clear). The timer's interrupt line is _level-triggered_: until that flag drops, the timer keeps waving at the GIC, and the GIC would immediately interrupt us all over again.
 
 Then we update the screen to show our progress!
 

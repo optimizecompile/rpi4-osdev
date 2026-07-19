@@ -36,7 +36,9 @@ void fb_init()
     mbox[21] = MBOX_TAG_SETPXLORDR;
     mbox[22] = 4;
     mbox[23] = 4;
-    mbox[24] = 1; // RGB
+    mbox[24] = 0; // BGR - our palette words are 0xRRGGBB, so blue must sit in byte 0.
+                  // (Old firmware ignored this tag and gave us BGR regardless;
+                  // current firmware honours it, so ask for what we mean!)
 
     mbox[25] = MBOX_TAG_GETFB;
     mbox[26] = 8;
